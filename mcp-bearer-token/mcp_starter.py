@@ -12,6 +12,10 @@ from pydantic import BaseModel, Field, AnyUrl
 import markdownify
 import httpx
 import readabilipy
+import base64
+import io
+import time
+from PIL import Image
 
 # --- Load environment variables ---
 load_dotenv()
@@ -119,7 +123,7 @@ class Fetch:
 
 # --- MCP Server Setup ---
 mcp = FastMCP(
-    "Job Finder MCP Server",
+    "Job Finder & Comic Generator MCP Server",
     auth=SimpleBearerAuthProvider(TOKEN),
 )
 
@@ -200,6 +204,121 @@ async def make_img_black_and_white(
         bw_base64 = base64.b64encode(bw_bytes).decode("utf-8")
 
         return [ImageContent(type="image", mimeType="image/png", data=bw_base64)]
+    except Exception as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
+
+# Comic Generation Tool
+COMIC_GENERATION_DESCRIPTION = RichToolDescription(
+    description="Generate a 3-panel comic strip from a base image and story guide using AI.",
+    use_when="Use this tool when the user wants to create a comic strip from a image url with a specific story theme.",
+    side_effects="Generates 3 comic panels and combines them into a final comic strip with text overlay.",
+)
+
+@mcp.tool(description=COMIC_GENERATION_DESCRIPTION.model_dump_json())
+async def generate_comic_strip_tool(
+    puch_image_data: Annotated[str, Field(description="Base64-encoded image ")],
+    story_guide: Annotated[str, Field(description="Very descriptive Story theme or guide for the comic")] = "Jokes about hackathon",
+    character_name: Annotated[str, Field(description="Name of the character in the comic")] = "Your Name",
+    reference_style_data: Annotated[str | None, Field(description="Base64-encoded reference style image (optional)")] = None,
+) -> list[TextContent | ImageContent]:
+    """
+    Generate a complete 3-panel comic strip from a base image with AI-generated panels and story.
+    """
+    import base64
+    import io
+    import tempfile
+    import shutil
+    from PIL import Image
+
+    try:
+        # Decode base image (following the same pattern as make_img_black_and_white)
+        base_image_bytes = base64.b64decode(puch_image_data)
+        base_image = Image.open(io.BytesIO(base_image_bytes))
+        
+        # Decode reference style image if provided
+        reference_style_image = None
+        if reference_style_data:
+            ref_image_bytes = base64.b64decode(reference_style_data)
+            reference_style_image = Image.open(io.BytesIO(ref_image_bytes))
+        
+        # Import comic generation modules
+        from text_generation import generate_comic_story
+        from image_generation import generate_comic_panels
+        from layout_generation import generate_comic_strip
+        from texture import apply_texture_overlay
+        
+        # Create temporary directory for processing
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            # Save base image to temp directory
+            base_image_path = os.path.join(temp_dir, "base_image.jpg")
+            base_image.save(base_image_path)
+            
+            # Handle reference style image
+            if reference_style_image:
+                reference_style_path = os.path.join(temp_dir, "reference_style.jpg")
+                reference_style_image.save(reference_style_path)
+            else:
+                # Use default reference style if available
+                default_ref_path = os.path.join(os.path.dirname(__file__), "Test_Images", "StyleReference.jpg")
+                if os.path.exists(default_ref_path):
+                    reference_style_path = default_ref_path
+                else:
+                    reference_style_path = base_image_path  # Use base image as reference
+            
+            # Generate comic panels
+            panels_dir = os.path.join(temp_dir, "panels")
+            generate_comic_panels(
+                story_guide=story_guide,
+                base_image_path=base_image_path,
+                reference_style_path=reference_style_path,
+                output_dir=panels_dir
+            )
+            
+            # Get generated panel paths
+            comic_images = [
+                os.path.join(panels_dir, "comic_panel_1.png"),
+                os.path.join(panels_dir, "comic_panel_2.png"),
+                os.path.join(panels_dir, "comic_panel_3.png")
+            ]
+            
+            # Generate story
+            story = generate_comic_story(comic_images, character_name)
+            
+            # Load panel images for layout
+            panel_images = [
+                Image.open(comic_images[0]),
+                Image.open(comic_images[1]),
+                Image.open(comic_images[2])
+            ]
+            
+            # Generate comic strip layout
+            comic_strip_path = os.path.join(temp_dir, "comic_strip.png")
+            generate_comic_strip(panel_images, story, output_path=comic_strip_path)
+            
+            # Apply texture overlay
+            final_comic_path = os.path.join(temp_dir, "final_comic.png")
+            apply_texture_overlay(comic_strip_path, output_path=final_comic_path)
+            
+            # Read final comic and convert to base64 (following the same pattern as make_img_black_and_white)
+            with open(final_comic_path, "rb") as f:
+                final_comic_bytes = f.read()
+            
+            final_comic_base64 = base64.b64encode(final_comic_bytes).decode("utf-8")
+            
+            # Create response with story and image
+            story_text = f"**{story['title']}**\n\n1. {story['text1']}\n2. {story['text2']}\n3. {story['text3']}"
+            
+            return [
+                TextContent(type="text", text=story_text),
+                ImageContent(type="image", mimeType="image/png", data=final_comic_base64)
+            ]
+            
+        finally:
+            # Clean up temporary directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
     except Exception as e:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
 
